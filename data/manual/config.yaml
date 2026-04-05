@@ -1,42 +1,18 @@
 # neighbourhood_run/data/manual/config.yaml
-# --- Project Configuration ---
-
-# User ID or name for this configuration
 user_id: "PEO"
-
-# Base CRS for all spatial analysis (EPSG:25832 is good for Denmark)
 project_crs: "EPSG:25832"
 
-# --- Home Location (provide one) ---
 home:
-  # Full address for geocoding (Nominatim)
   address: "Bakke Allé 11B, 8230 Åbyhøj, Denmark"
-  
-  # Or provide coordinates directly if address is not used
-  # Coords must be in WGS84 (lat/lon)
-  # latitude: 56.1539
-  # longitude: 10.1633
 
-# --- Target Area Definition ---
 area:
-  # Query to find the area boundary in OSM/Nominatim
-  query: 
-    postalcode: "8230"
-    country: "Denmark"
-  buffer_meters: 2000  # Buffer around the area boundary to include in the network
-  
-# --- File Paths (relative to project root) ---
+  postalcode: "8230"
+  country: "DK"
+  buffer_meters: 200
+
 paths:
-  # Raw data storage
   raw_boundary: "data/raw/boundaries/postcode_boundary.gpkg"
-  raw_osm: "data/raw/osm/osm_download.pbf"
-  
-  # Processed data
   processed_home: "data/processed/home_location.gpkg"
   processed_network: "data/processed/network/runnable_network.gpkg"
-  
-  # Manual files
   manual_exclusions: "data/manual/exclusions.gpkg"
-  
-  # Web outputs
   map_view_html: "templates/map_view.html"
