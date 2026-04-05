@@ -1,0 +1,20 @@
+# neighbourhood_run/pyproject.toml
+[project]
+name = "neighbourhood_run"
+version = "0.1.0"
+description = "A tool to plan runs to cover every street in a neighbourhood."
+dependencies = [
+    "flask",
+    "geopandas",
+    "osmnx",
+    "pyogrio",
+    "pyyaml",
+    "folium",
+    "pydantic",
+    "requests",
+    "rich",
+]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
