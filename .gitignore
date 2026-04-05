@@ -131,6 +131,9 @@ __pypackages__/
 celerybeat-schedule
 celerybeat.pid
 
+# Secrets
+secrets.yaml
+
 # SageMath parsed files
 *.sage.py
 # Environments
@@ -208,3 +211,11 @@ __marimo__/
 
 # cache files
 cache/
+
+# Data files (optional - you may want to track some of these)
+data/raw/garmin/
+data/processed/
+
+# Python
+__pycache__/
+*.pyc
