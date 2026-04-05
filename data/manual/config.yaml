@@ -23,7 +23,7 @@ area:
   query: 
     postalcode: "8230"
     country: "Denmark"
-  buffer_meters: 50
+  buffer_meters: 2000  # Buffer around the area boundary to include in the network
   
 # --- File Paths (relative to project root) ---
 paths:

@@ -2,6 +2,8 @@
 import geopandas as gpd
 import osmnx as ox
 from shapely.geometry import Point
+from shapely.ops import transform as shapely_transform
+from pyproj import Transformer
 from rich.console import Console
 import warnings
 from .config import CONFIG
@@ -56,59 +58,76 @@ def geocode_home() -> gpd.GeoDataFrame:
 
 def build_runnable_network(boundary_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
-    Downloads, filters, and clips the OSM network to the boundary using an
-    explicit, manual clipping process for maximum reliability.
+    Downloads, filters, and clips the OSM network to the boundary.
+    Uses a buffer for downloading to ensure roads at the boundary edge
+    are fully captured, then clips precisely to the real boundary.
     """
     output_path = CONFIG.paths.processed_network
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 1. Prepare the boundary polygon for clipping later
-    console.log("Preparing boundary for clipping...")
+    # 1. Project boundary to local CRS for accurate buffering
+    console.log("Preparing boundary...")
     boundary_proj = boundary_gdf.to_crs(CONFIG.project_crs)
-    # Dissolve into a single-row GeoDataFrame that will be our mask
-    boundary_dissolved_gdf = boundary_proj.dissolve(by=boundary_proj.index.to_series().map(lambda x: 1))
 
-    # 2. Get the graph for a slightly larger area (the bounding box)
-    polygon_wgs84 = boundary_gdf.unary_union
-    console.log("Downloading data for the area's bounding box...")
+    # 2. Create a buffered version for data download
+    buffer_dist = CONFIG.area.buffer_meters
+    console.log(f"Buffering boundary by {buffer_dist}m for complete road coverage...")
+    buffered_geom = boundary_proj.geometry.iloc[0].buffer(buffer_dist)
+
+    # 3. Transform the buffered geometry back to WGS84 for OSMnx
+    transformer = Transformer.from_crs(CONFIG.project_crs, "EPSG:4326", always_xy=True)
+    buffered_wgs84 = shapely_transform(transformer.transform, buffered_geom)
+
+    # 4. Download network for the buffered area
+    console.log("Downloading OSM data for the buffered area...")
     G = ox.graph_from_polygon(
-        polygon_wgs84,
+        buffered_wgs84,
         custom_filter=HIGHWAY_FILTER,
         retain_all=True,
-        truncate_by_edge=False # Set to False, we will do our own clipping
+        truncate_by_edge=False
     )
-    
+
     console.log("Converting graph to GeoDataFrame...")
     edges = ox.graph_to_gdfs(G, nodes=False)
-    
+
     if edges.empty:
         console.log("[yellow]Warning: No runnable ways found in the area.[/yellow]")
         return gpd.GeoDataFrame()
 
-    # 3. Perform a precise, manual clip
-    console.log("Projecting downloaded network to local CRS...")
+    # 5. Project downloaded edges to local CRS
+    console.log("Projecting to local CRS...")
     edges_proj = edges.to_crs(CONFIG.project_crs)
 
-    console.log("Performing precise clip to the boundary shape...")
-    # Use the entire dissolved GeoDataFrame as the mask for clipping
-    clipped_edges = gpd.clip(edges_proj, boundary_dissolved_gdf)
-    
-    # --- The rest of the function cleans up the clipped result ---
-    console.log("Cleaning and processing final clipped network...")
-    
+    # 6. Clip precisely to the ORIGINAL (un-buffered) boundary
+    console.log("Clipping network to the precise boundary...")
+    # Prepare the clip mask as a proper GeoDataFrame
+    boundary_proj["_dissolve"] = 1
+    clip_mask = boundary_proj.dissolve(by="_dissolve")
+    clipped_edges = gpd.clip(edges_proj, clip_mask)
+
+    # 7. Clean up the result
+    console.log("Cleaning and processing final network...")
+
     if clipped_edges.empty:
         console.log("[yellow]Warning: No ways remaining after clipping.[/yellow]")
         return gpd.GeoDataFrame()
-        
+
     final_edges = clipped_edges.explode(index_parts=True).reset_index(drop=True)
     final_edges['length_m'] = final_edges.geometry.length
     final_edges = final_edges[final_edges['length_m'] > 1.0].copy()
+    final_edges = final_edges.reset_index(drop=True)
     final_edges['edge_id'] = range(len(final_edges))
-    
-    cols_to_keep = ['edge_id', 'osmid', 'highway', 'name', 'service', 'oneway', 'length_m', 'geometry']
+
+    cols_to_keep = [
+        'edge_id', 'osmid', 'highway', 'name', 'service',
+        'oneway', 'length_m', 'geometry'
+    ]
     final_edges = final_edges[[col for col in cols_to_keep if col in final_edges.columns]]
-    
+
     final_edges.to_file(str(output_path), driver="GPKG", index=False)
+
+    total_km = final_edges['length_m'].sum() / 1000
     console.log(f"[green]✔[/green] Runnable network saved to '{output_path}'")
-    
+    console.log(f"[green]✔[/green] Total runnable distance: {total_km:.1f} km")
+
     return final_edges
