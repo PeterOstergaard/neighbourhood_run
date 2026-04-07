@@ -8,11 +8,14 @@ dependencies = [
     "geopandas",
     "osmnx",
     "pyogrio",
+    "pyproj",
     "pyyaml",
     "folium",
     "pydantic",
     "requests",
     "rich",
+    "garminconnect",
+    "gpxpy",
 ]
 
 [build-system]

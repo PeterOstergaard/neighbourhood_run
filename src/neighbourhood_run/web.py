@@ -6,8 +6,9 @@ from .config import CONFIG
 
 console = Console()
 
+
 def create_network_map() -> folium.Map:
-    """Creates a Folium map visualizing the boundary, home, network, and review flags."""
+    """Creates a Folium map with boundary, network, tracks, and review flags."""
     try:
         boundary_gdf = gpd.read_file(str(CONFIG.paths.raw_boundary))
         home_gdf = gpd.read_file(str(CONFIG.paths.processed_home))
@@ -21,18 +22,24 @@ def create_network_map() -> folium.Map:
     home_web = home_gdf.to_crs("EPSG:4326")
     network_web = network_gdf.to_crs("EPSG:4326")
 
-    # Create map centered on the area
+    # Center map
     centroid = boundary_web.geometry.iloc[0].centroid
-    m = folium.Map(location=[centroid.y, centroid.x], zoom_start=14, tiles="cartodbpositron")
+    m = folium.Map(
+        location=[centroid.y, centroid.x],
+        zoom_start=14,
+        tiles="cartodbpositron"
+    )
 
-    # Add boundary
+    # --- Boundary layer ---
     folium.GeoJson(
         boundary_web,
-        style_function=lambda x: {'color': 'black', 'weight': 2, 'fillOpacity': 0.05},
+        style_function=lambda x: {
+            'color': 'black', 'weight': 2, 'fillOpacity': 0.05
+        },
         name='Postal Code Boundary'
     ).add_to(m)
 
-    # Split network into regular and review-flagged segments
+    # --- Network layers ---
     has_review = "review_flag" in network_web.columns
 
     if has_review:
@@ -42,33 +49,67 @@ def create_network_map() -> folium.Map:
         flagged = gpd.GeoDataFrame()
         normal = network_web
 
-    # Add normal network (blue)
+    # Normal network (blue)
     if not normal.empty:
+        tooltip_fields = [f for f in ['name', 'highway', 'length_m'] if f in normal.columns]
+        tooltip_aliases = ['Name', 'Type', 'Length (m)'][:len(tooltip_fields)]
         folium.GeoJson(
             normal,
-            style_function=lambda x: {'color': 'blue', 'weight': 2, 'opacity': 0.7},
+            style_function=lambda x: {
+                'color': 'blue', 'weight': 2, 'opacity': 0.7
+            },
             tooltip=folium.GeoJsonTooltip(
-                fields=[f for f in ['name', 'highway', 'length_m'] if f in normal.columns],
-                aliases=[f for f in ['Name', 'Type', 'Length (m)'] if True],
+                fields=tooltip_fields,
+                aliases=tooltip_aliases,
                 sticky=True
             ),
             name='Runnable Network'
         ).add_to(m)
 
-    # Add flagged network (orange)
+    # Flagged network (orange)
     if not flagged.empty:
+        tooltip_fields = [f for f in ['name', 'highway', 'review_flag'] if f in flagged.columns]
+        tooltip_aliases = ['Name', 'Type', 'Review Reason'][:len(tooltip_fields)]
         folium.GeoJson(
             flagged,
-            style_function=lambda x: {'color': 'orange', 'weight': 3, 'opacity': 0.9},
+            style_function=lambda x: {
+                'color': 'orange', 'weight': 3, 'opacity': 0.9
+            },
             tooltip=folium.GeoJsonTooltip(
-                fields=[f for f in ['name', 'highway', 'review_flag'] if f in flagged.columns],
-                aliases=[f for f in ['Name', 'Type', 'Review Reason'] if True],
+                fields=tooltip_fields,
+                aliases=tooltip_aliases,
                 sticky=True
             ),
             name='Flagged for Review'
         ).add_to(m)
 
-    # Add home
+    # --- GPS Tracks layer ---
+    tracks_path = CONFIG.paths.processed_tracks
+    if tracks_path.exists():
+        try:
+            tracks_gdf = gpd.read_file(str(tracks_path))
+            if not tracks_gdf.empty:
+                tracks_web = tracks_gdf.to_crs("EPSG:4326")
+                tooltip_fields = [f for f in ['activity_id', 'start_time', 'length_m']
+                                  if f in tracks_web.columns]
+                tooltip_aliases = ['Activity ID', 'Date', 'Length (m)'][:len(tooltip_fields)]
+                folium.GeoJson(
+                    tracks_web,
+                    style_function=lambda x: {
+                        'color': 'red', 'weight': 2, 'opacity': 0.5
+                    },
+                    tooltip=folium.GeoJsonTooltip(
+                        fields=tooltip_fields,
+                        aliases=tooltip_aliases,
+                        sticky=True
+                    ),
+                    name='GPS Tracks'
+                ).add_to(m)
+                console.log(f"  Added {len(tracks_web)} GPS tracks to map")
+        except Exception as e:
+            console.log(f"  [yellow]Could not load tracks: {e}[/yellow]")
+
+    # --- Home marker ---
     home_point = [home_web.geometry.iloc[0].y, home_web.geometry.iloc[0].x]
     folium.Marker(
         location=home_point,
