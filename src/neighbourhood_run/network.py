@@ -405,14 +405,82 @@ def build_runnable_network(boundary_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     filtered = _add_review_flags(filtered)
 
     # --- FINAL CLEANUP AND SAVE ---
-    console.log("[bold]Step 8: Saving final network...[/bold]")
+    console.log("[bold]Step 8: Connectivity analysis and saving...[/bold]")
     # Reassign edge IDs after all filtering
     filtered = filtered.reset_index(drop=True)
     filtered['edge_id'] = range(len(filtered))
 
+    # Determine reachability from home
+    import networkx as nx
+    from shapely.geometry import Point as ShapelyPoint
+
+    home_gdf = gpd.read_file(str(CONFIG.paths.processed_home))
+    home_proj = home_gdf.to_crs(CONFIG.project_crs)
+    home_point = home_proj.geometry.iloc[0]
+
+    # Build a connectivity graph
+    SNAP_TOLERANCE = 0.5
+    node_map_local = {}
+    node_id_local = 0
+
+    def get_or_create_node_local(x, y):
+        nonlocal node_id_local
+        for (nx_, ny_), nid in node_map_local.items():
+            if ((nx_ - x)**2 + (ny_ - y)**2)**0.5 < SNAP_TOLERANCE:
+                return nid
+        node_map_local[(x, y)] = node_id_local
+        node_id_local += 1
+        return node_id_local - 1
+
+    G_conn = nx.Graph()
+    node_coords_local = {}
+    edge_nodes_local = {}
+
+    filtered_proj = filtered.to_crs(CONFIG.project_crs) if filtered.crs != CONFIG.project_crs else filtered
+
+    for _, row in filtered_proj.iterrows():
+        coords = list(row.geometry.coords)
+        sn = get_or_create_node_local(coords[0][0], coords[0][1])
+        en = get_or_create_node_local(coords[-1][0], coords[-1][1])
+        node_coords_local[sn] = coords[0]
+        node_coords_local[en] = coords[-1]
+        G_conn.add_edge(sn, en, edge_id=row["edge_id"])
+        edge_nodes_local[row["edge_id"]] = (sn, en)
+
+    # Find home node
+    min_dist = float('inf')
+    home_node_local = None
+    for nid, (nx_, ny_) in node_coords_local.items():
+        dist = ((nx_ - home_point.x)**2 + (ny_ - home_point.y)**2)**0.5
+        if dist < min_dist:
+            min_dist = dist
+            home_node_local = nid
+
+    # Find home component
+    home_comp_nodes = set()
+    if home_node_local is not None:
+        home_comp_nodes = nx.node_connected_component(G_conn, home_node_local)
+
+    # Mark each edge as reachable or not
+    def is_reachable(edge_id):
+        if edge_id in edge_nodes_local:
+            sn, en = edge_nodes_local[edge_id]
+            return sn in home_comp_nodes or en in home_comp_nodes
+        return False
+
+    filtered["reachable"] = filtered["edge_id"].apply(is_reachable)
+    n_reachable = filtered["reachable"].sum()
+    n_unreachable = len(filtered) - n_reachable
+    reach_km = filtered.loc[filtered["reachable"], "length_m"].sum() / 1000
+    unreach_km = filtered.loc[~filtered["reachable"], "length_m"].sum() / 1000
+
+    console.log(f"  Reachable from home: {n_reachable} edges, {reach_km:.1f} km")
+    console.log(f"  Unreachable islands: {n_unreachable} edges, {unreach_km:.1f} km")
+
     cols_to_keep = [
         'edge_id', 'osmid', 'highway', 'name', 'service',
-        'sidewalk', 'access', 'oneway', 'length_m', 'required', 'review_flag', 'geometry'
+        'sidewalk', 'access', 'oneway', 'length_m', 'required',
+        'reachable', 'review_flag', 'geometry'
     ]
     final_edges = filtered[[col for col in cols_to_keep if col in filtered.columns]]
 
