@@ -10,9 +10,20 @@ area:
   country: "DK"
   buffer_meters: 200
 
+garmin:
+  import_radius_km: 10
+  activity_types:
+    - running
+  rate_limit_seconds: 2
+  batch_size: 50
+
 paths:
   raw_boundary: "data/raw/boundaries/postcode_boundary.gpkg"
   processed_home: "data/processed/home_location.gpkg"
   processed_network: "data/processed/network/runnable_network.gpkg"
   manual_exclusions: "data/manual/exclusions.gpkg"
   map_view_html: "templates/map_view.html"
+  raw_garmin: "data/raw/garmin/activities"
+  garmin_activity_list: "data/raw/garmin/activity_list.json"
+  processed_tracks: "data/processed/tracks/tracks.gpkg"
+  track_summary: "data/processed/tracks/track_summary.gpkg"

@@ -64,6 +64,8 @@ db.sqlite3-journal
 # Flask stuff:
 instance/
 .webassets-cache
+*.html
+map_view.html
 
 # Scrapy stuff:
 .scrapy
@@ -219,3 +221,7 @@ data/processed/
 # Python
 __pycache__/
 *.pyc
+
+# Garmin session cache
+.session_cache
+templates/map_view.html
