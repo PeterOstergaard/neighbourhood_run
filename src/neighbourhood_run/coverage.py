@@ -256,13 +256,20 @@ def _save_and_summarize(network: gpd.GeoDataFrame):
     total_km = network["length_m"].sum() / 1000
 
     if "covered" in network.columns:
-        covered_mask = network["covered"]
+        # Filter to required segments only for the main stats
+        if "required" in network.columns:
+            required = network[network["required"] == True]
+        else:
+            required = network
+
+        total_required_km = required["length_m"].sum() / 1000
+        covered_mask = required["covered"]
         covered_edges = covered_mask.sum()
-        covered_km = network.loc[covered_mask, "length_m"].sum() / 1000
-        uncovered_edges = total_edges - covered_edges
-        uncovered_km = total_km - covered_km
-        pct_edges = (covered_edges / total_edges * 100) if total_edges > 0 else 0
-        pct_km = (covered_km / total_km * 100) if total_km > 0 else 0
+        covered_km = required.loc[covered_mask, "length_m"].sum() / 1000
+        uncovered_edges = len(required) - covered_edges
+        uncovered_km = total_required_km - covered_km
+        pct_edges = (covered_edges / len(required) * 100) if len(required) > 0 else 0
+        pct_km = (covered_km / total_required_km * 100) if total_required_km > 0 else 0
     else:
         covered_edges = 0
         covered_km = 0
@@ -273,10 +280,14 @@ def _save_and_summarize(network: gpd.GeoDataFrame):
 
     console.log("")
     console.log("[bold cyan]═══ Coverage Summary ═══[/bold cyan]")
+    n_optional = len(network[network.get("required", True) == False]) if "required" in network.columns else 0
+    optional_km = network.loc[network.get("required", True) == False, "length_m"].sum() / 1000 if "required" in network.columns else 0
+
     console.log(f"  Total network:     {total_edges:,} edges  /  {total_km:.1f} km")
+    console.log(f"  Optional:          {n_optional:,} edges  /  {optional_km:.1f} km (connectors)")
+    console.log(f"  Required:          {len(required):,} edges  /  {total_required_km:.1f} km")
     console.log(f"  Covered:           {covered_edges:,} edges  /  {covered_km:.1f} km  ({pct_km:.1f}%)")
     console.log(f"  Uncovered:         {uncovered_edges:,} edges  /  {uncovered_km:.1f} km  ({100 - pct_km:.1f}%)")
-    console.log(f"  Coverage by edges: {pct_edges:.1f}%")
     console.log(f"  Coverage by km:    {pct_km:.1f}%")
 
     # Breakdown by road type

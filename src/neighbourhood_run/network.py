@@ -106,12 +106,11 @@ def _download_exclusion_zones(boundary_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFram
 
 def _apply_sidewalk_filter(edges: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
-    Phase 2: Removes primary/secondary roads that do not have
-    an explicit sidewalk tag indicating a sidewalk is present.
+    Phase 2: Marks primary/secondary roads without sidewalk tags as optional.
+    They are kept in the network for connectivity but not required for coverage.
     """
     console.log("Applying sidewalk filter to major roads...")
 
-    # Normalize the highway column: OSMnx sometimes returns lists
     def normalize_highway(val):
         if isinstance(val, list):
             return val[0]
@@ -119,7 +118,6 @@ def _apply_sidewalk_filter(edges: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
     edges["_highway_norm"] = edges["highway"].apply(normalize_highway)
 
-    # Normalize the sidewalk column
     def normalize_sidewalk(val):
         if pd.isna(val):
             return ""
@@ -132,22 +130,25 @@ def _apply_sidewalk_filter(edges: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     else:
         edges["_sidewalk_norm"] = ""
 
-    # Identify rows that are major roads WITHOUT a valid sidewalk
     is_major = edges["_highway_norm"].isin(SIDEWALK_REQUIRED_HIGHWAYS)
     has_sidewalk = edges["_sidewalk_norm"].isin(VALID_SIDEWALK_VALUES)
 
-    excluded = is_major & ~has_sidewalk
-    n_excluded = excluded.sum()
+    no_sidewalk = is_major & ~has_sidewalk
+    n_no_sidewalk = no_sidewalk.sum()
 
     console.log(f"  Major roads found: {is_major.sum()}")
     console.log(f"  Major roads WITH sidewalk: {(is_major & has_sidewalk).sum()}")
-    console.log(f"  Major roads WITHOUT sidewalk (excluded): {n_excluded}")
+    console.log(f"  Major roads WITHOUT sidewalk (marked optional): {n_no_sidewalk}")
 
-    # Keep everything that is NOT (major road without sidewalk)
-    result = edges[~excluded].copy()
+    # Initialize required column if it doesn't exist yet
+    if "required" not in edges.columns:
+        edges["required"] = True
+
+    # Mark major roads without sidewalk as optional connectors
+    edges.loc[no_sidewalk, "required"] = False
 
     # Clean up temporary columns
-    result = result.drop(columns=["_highway_norm", "_sidewalk_norm"], errors="ignore")
+    result = edges.drop(columns=["_highway_norm", "_sidewalk_norm"], errors="ignore")
 
     return result
 
@@ -242,11 +243,12 @@ def _apply_manual_exclusions(edges: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 def _add_review_flags(edges: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
     Adds a 'review_flag' column to edges that might need manual review.
+    Only flags genuinely ambiguous cases that require human judgment.
     """
     console.log("Adding review flags...")
     flags = pd.Series([""] * len(edges), index=edges.index)
 
-    # Flag 1: Ambiguous access
+    # Flag 1: Ambiguous access tags
     if "access" in edges.columns:
         ambiguous_access = {"permissive", "destination", "customers"}
 
@@ -258,49 +260,33 @@ def _add_review_flags(edges: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
             return str(val).lower().strip() in ambiguous_access
 
         mask = edges["access"].apply(check_access)
-        flags[mask] = flags[mask].apply(lambda x: x + "Ambiguous access; " if x else "Ambiguous access; ")
+        flags[mask] = flags[mask].apply(
+            lambda x: x + "Ambiguous access; " if x else "Ambiguous access; "
+        )
         console.log(f"  Ambiguous access: {mask.sum()}")
 
-    # Flag 2: Tertiary roads without sidewalk info
+    # Flag 2: Unnamed service roads longer than 50m
     def normalize_highway(val):
         if isinstance(val, list):
             return val[0]
-        return val
+        return str(val)
 
     hw_norm = edges["highway"].apply(normalize_highway)
-    is_tertiary = hw_norm.isin({"tertiary", "tertiary_link"})
+    is_service = hw_norm == "service"
+    is_unnamed = edges["name"].isna() | (edges["name"] == "")
+    is_long = edges["length_m"] > 75
 
-    if "sidewalk" in edges.columns:
-        def has_sidewalk_info(val):
-            if pd.isna(val):
-                return False
-            if isinstance(val, list):
-                return True
-            return str(val).strip() != ""
-
-        no_sidewalk_info = ~edges["sidewalk"].apply(has_sidewalk_info)
-    else:
-        no_sidewalk_info = pd.Series([True] * len(edges), index=edges.index)
-
-    tertiary_no_sw = is_tertiary & no_sidewalk_info
-    flags[tertiary_no_sw] = flags[tertiary_no_sw].apply(
-        lambda x: x + "No sidewalk info; " if x else "No sidewalk info; "
+    suspicious_service = is_service & is_unnamed & is_long
+    flags[suspicious_service] = flags[suspicious_service].apply(
+        lambda x: x + "Unnamed service road; " if x else "Unnamed service road; "
     )
-    console.log(f"  Tertiary without sidewalk info: {tertiary_no_sw.sum()}")
-
-    # Flag 3: Very short segments
-    short = edges["length_m"] < 10
-    flags[short] = flags[short].apply(
-        lambda x: x + "Short segment; " if x else "Short segment; "
-    )
-    console.log(f"  Short segments (<10m): {short.sum()}")
+    console.log(f"  Unnamed service roads (>50m): {suspicious_service.sum()}")
 
     edges["review_flag"] = flags
     total_flagged = (flags != "").sum()
     console.log(f"  [green]✔[/green] Total flagged for review: {total_flagged}")
 
     return edges
-
 
 def build_runnable_network(boundary_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
@@ -361,7 +347,7 @@ def build_runnable_network(boundary_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     # Explode and clean
     clipped = clipped.explode(index_parts=True).reset_index(drop=True)
     clipped['length_m'] = clipped.geometry.length
-    clipped = clipped[clipped['length_m'] > 1.0].copy()
+    clipped = clipped[clipped['length_m'] > 0.5].copy()
     clipped = clipped.reset_index(drop=True)
 
     console.log(f"  After clipping: {len(clipped)} edges, {clipped['length_m'].sum() / 1000:.1f} km")
@@ -369,7 +355,37 @@ def build_runnable_network(boundary_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     # --- PHASE 2: SIDEWALK FILTER ---
     console.log("[bold]Step 4: Applying sidewalk filter (Phase 2)...[/bold]")
     filtered = _apply_sidewalk_filter(clipped)
-    console.log(f"  After sidewalk filter: {len(filtered)} edges, {filtered['length_m'].sum() / 1000:.1f} km")
+    required_after_sw = filtered["required"].sum() if "required" in filtered.columns else len(filtered)
+    console.log(f"  After sidewalk filter: {len(filtered)} edges ({required_after_sw} required), {filtered['length_m'].sum() / 1000:.1f} km")
+    # --- PHASE 2b: MARK OPTIONAL SEGMENTS ---
+    console.log("[bold]Step 4b: Marking optional segments...[/bold]")
+    def normalize_highway_2b(val):
+        if isinstance(val, list):
+            return val[0]
+        return str(val)
+
+    hw_norm_2b = filtered["highway"].apply(normalize_highway_2b)
+    is_service_2b = hw_norm_2b == "service"
+    is_unnamed_2b = filtered["name"].isna() | (filtered["name"] == "")
+    is_short_service_2b = filtered["length_m"] <= 75
+
+    # Mark all segments as required by default
+    filtered["required"] = True
+
+    # Rule 1: Short unnamed service roads are optional (connectors only)
+    optional_service = is_service_2b & is_unnamed_2b & is_short_service_2b
+    filtered.loc[optional_service, "required"] = False
+
+    # Rule 2: Very short segments (< 10m) of any type are optional
+    # These are typically clipping artifacts but must stay for connectivity
+    very_short = filtered["length_m"] < 10.0
+    filtered.loc[very_short, "required"] = False
+
+    n_optional = (~filtered["required"]).sum()
+    required_km = filtered.loc[filtered["required"], "length_m"].sum() / 1000
+    optional_km = filtered.loc[~filtered["required"], "length_m"].sum() / 1000
+    console.log(f"  Required segments: {filtered['required'].sum()} ({required_km:.1f} km)")
+    console.log(f"  Optional segments (connectors): {n_optional} ({optional_km:.1f} km)")
 
     # --- PHASE 3: SPATIAL EXCLUSIONS ---
     console.log("[bold]Step 5: Applying spatial exclusions (Phase 3)...[/bold]")
@@ -396,7 +412,7 @@ def build_runnable_network(boundary_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
     cols_to_keep = [
         'edge_id', 'osmid', 'highway', 'name', 'service',
-        'sidewalk', 'access', 'oneway', 'length_m', 'review_flag', 'geometry'
+        'sidewalk', 'access', 'oneway', 'length_m', 'required', 'review_flag', 'geometry'
     ]
     final_edges = filtered[[col for col in cols_to_keep if col in filtered.columns]]
 
