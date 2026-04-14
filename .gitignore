@@ -65,6 +65,7 @@ db.sqlite3-journal
 instance/
 .webassets-cache
 *.html
+map_view.html
 
 # Scrapy stuff:
 .scrapy
@@ -223,3 +224,4 @@ __pycache__/
 
 # Garmin session cache
 .session_cache
+templates/map_view.html
