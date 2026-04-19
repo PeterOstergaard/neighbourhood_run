@@ -2,7 +2,7 @@
 import geopandas as gpd
 import osmnx as ox
 import pandas as pd
-from shapely.geometry import Point
+from shapely.geometry import Point, LineString
 from shapely.ops import transform as shapely_transform
 from pyproj import Transformer
 from rich.console import Console
@@ -17,15 +17,16 @@ console = Console()
 # This is applied at download time. It removes the obvious exclusions.
 HIGHWAY_FILTER = (
     '["highway"]["area"!~"yes"]["access"!~"private"]'
-    '["highway"!~"motorway|motorway_link|trunk|trunk_link|bus_guideway|raceway|corridor|construction|proposed"]'
+    '["highway"!~"motorway|motorway_link|trunk|trunk_link|bus_guideway|raceway|corridor|construction|proposed|platform"]'
     '["service"!~"parking_aisle|driveway"]'
+    '["foot"!~"no"]'
 )
 
 # --- PHASE 3: SPATIAL EXCLUSION ZONES ---
 # OSM tags that define areas where running is not appropriate.
 # We download these as polygons and remove any network edges inside them.
 EXCLUSION_ZONE_TAGS = {
-    "landuse": ["cemetery", "military"],
+    "landuse": ["cemetery", "military", "allotments"],
     "amenity": ["school"],
 }
 
@@ -283,7 +284,12 @@ def _add_review_flags(edges: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     console.log(f"  Unnamed service roads (>50m): {suspicious_service.sum()}")
 
     edges["review_flag"] = flags
-    total_flagged = (flags != "").sum()
+    
+    # Don't flag optional/buffer-zone segments — they don't need review
+    if "required" in edges.columns:
+        edges.loc[edges["required"] == False, "review_flag"] = ""
+    
+    total_flagged = (edges["review_flag"] != "").sum()
     console.log(f"  [green]✔[/green] Total flagged for review: {total_flagged}")
 
     return edges
@@ -332,13 +338,23 @@ def build_runnable_network(boundary_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
     console.log(f"  Downloaded {len(edges)} edges")
 
-    # --- CLIP TO BOUNDARY ---
-    console.log("[bold]Step 3: Clipping to boundary...[/bold]")
+# --- CLIP AND MARK BOUNDARY ZONES ---
+    console.log("[bold]Step 3: Processing boundary zones...[/bold]")
     edges_proj = edges.to_crs(CONFIG.project_crs)
 
+    # Prepare the exact boundary for determining required/optional
     boundary_proj["_dissolve"] = 1
     clip_mask = boundary_proj.dissolve(by="_dissolve")
-    clipped = gpd.clip(edges_proj, clip_mask)
+    exact_boundary_geom = clip_mask.geometry.iloc[0]
+
+    # Prepare the buffered boundary for the outer limit
+    buffered_boundary_geom = exact_boundary_geom.buffer(CONFIG.area.buffer_meters)
+
+    # Clip to the BUFFERED boundary (keeps connector roads outside the exact boundary)
+    buffered_mask = gpd.GeoDataFrame(
+        geometry=[buffered_boundary_geom], crs=CONFIG.project_crs
+    )
+    clipped = gpd.clip(edges_proj, buffered_mask)
 
     if clipped.empty:
         console.log("[yellow]Warning: No ways remaining after clipping.[/yellow]")
@@ -348,7 +364,45 @@ def build_runnable_network(boundary_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     clipped = clipped.explode(index_parts=True).reset_index(drop=True)
     clipped['length_m'] = clipped.geometry.length
     clipped = clipped[clipped['length_m'] > 0.5].copy()
+
+    # Determine which edges are inside the exact boundary (required)
+    # vs in the buffer zone (optional connectors)
+    console.log("  Determining boundary zones...")
+    midpoints = clipped.geometry.interpolate(0.5, normalized=True)
+    inside_boundary = midpoints.within(exact_boundary_geom)
+    clipped["_inside_boundary"] = inside_boundary
+
+    n_inside = inside_boundary.sum()
+    n_buffer = len(clipped) - n_inside
+    console.log(f"  Inside boundary: {n_inside} edges")
+    console.log(f"  Buffer zone (connectors): {n_buffer} edges")
+
+    # Deduplicate: OSMnx creates two directed edges per road segment
+    console.log("  Deduplicating directed edges...")
+    before_dedup = len(clipped)
+    clipped['_geom_wkt'] = clipped.geometry.apply(
+        lambda g: g.wkt if g is not None else None
+    )
+    clipped['_geom_wkt_rev'] = clipped.geometry.apply(
+        lambda g: LineString(g.coords[::-1]).wkt if g is not None else None
+    )
+
+    seen_geoms = set()
+    keep_mask = []
+    for _, row in clipped.iterrows():
+        wkt = row['_geom_wkt']
+        wkt_rev = row['_geom_wkt_rev']
+        if wkt in seen_geoms or wkt_rev in seen_geoms:
+            keep_mask.append(False)
+        else:
+            seen_geoms.add(wkt)
+            keep_mask.append(True)
+
+    clipped = clipped[keep_mask].copy()
+    clipped = clipped.drop(columns=['_geom_wkt', '_geom_wkt_rev'])
     clipped = clipped.reset_index(drop=True)
+
+    console.log(f"  Deduplicated: {before_dedup} → {len(clipped)} edges")
 
     console.log(f"  After clipping: {len(clipped)} edges, {clipped['length_m'].sum() / 1000:.1f} km")
 
@@ -369,24 +423,50 @@ def build_runnable_network(boundary_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     is_unnamed_2b = filtered["name"].isna() | (filtered["name"] == "")
     is_short_service_2b = filtered["length_m"] <= 75
 
-    # Mark all segments as required by default
-    filtered["required"] = True
+    # Start with boundary zone info if available
+    if "_inside_boundary" in filtered.columns:
+        filtered["required"] = filtered["_inside_boundary"]
+        filtered = filtered.drop(columns=["_inside_boundary"])
+    else:
+        filtered["required"] = True
 
-    # Rule 1: Short unnamed service roads are optional (connectors only)
+    # Rule 1: Short unnamed service roads are optional
     optional_service = is_service_2b & is_unnamed_2b & is_short_service_2b
     filtered.loc[optional_service, "required"] = False
 
-    # Rule 2: Very short segments (< 10m) of any type are optional
-    # These are typically clipping artifacts but must stay for connectivity
-    very_short = filtered["length_m"] < 10.0
-    filtered.loc[very_short, "required"] = False
-
-    n_optional = (~filtered["required"]).sum()
-    required_km = filtered.loc[filtered["required"], "length_m"].sum() / 1000
-    optional_km = filtered.loc[~filtered["required"], "length_m"].sum() / 1000
-    console.log(f"  Required segments: {filtered['required'].sum()} ({required_km:.1f} km)")
-    console.log(f"  Optional segments (connectors): {n_optional} ({optional_km:.1f} km)")
-
+# Rule 2: Very short segments (< 10m) are optional UNLESS both their
+    # endpoints connect to required segments (making them legitimate connectors)
+    very_short_mask = filtered["length_m"] < 10.0
+    
+    if very_short_mask.any():
+        # Collect all endpoints of required (non-short) segments into a set
+        required_non_short = filtered[filtered["required"] & ~very_short_mask]
+        endpoint_set = set()
+        
+        for _, row in required_non_short.iterrows():
+            coords = list(row.geometry.coords)
+            endpoint_set.add((round(coords[0][0], 1), round(coords[0][1], 1)))
+            endpoint_set.add((round(coords[-1][0], 1), round(coords[-1][1], 1)))
+        
+        # For each short segment, check if both endpoints match
+        n_kept = 0
+        n_optional = 0
+        for idx in filtered[very_short_mask].index:
+            coords = list(filtered.loc[idx, "geometry"].coords)
+            start = (round(coords[0][0], 1), round(coords[0][1], 1))
+            end = (round(coords[-1][0], 1), round(coords[-1][1], 1))
+            
+            if start in endpoint_set and end in endpoint_set:
+                n_kept += 1
+                # Leave required = True (already set by default or boundary check)
+            else:
+                filtered.loc[idx, "required"] = False
+                n_optional += 1
+        
+        console.log(f"  Short segments (<10m): {n_kept} are connectors (required), {n_optional} optional")
+    else:
+        console.log(f"  No short segments found")
+    
     # --- PHASE 3: SPATIAL EXCLUSIONS ---
     console.log("[bold]Step 5: Applying spatial exclusions (Phase 3)...[/bold]")
     exclusion_zones = _download_exclusion_zones(boundary_gdf)

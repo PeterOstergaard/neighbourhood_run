@@ -90,6 +90,129 @@ def analyze_coverage() -> gpd.GeoDataFrame:
 
     return network
 
+def update_coverage_incremental(new_tracks: gpd.GeoDataFrame = None) -> gpd.GeoDataFrame:
+    """
+    Incremental coverage update. Only processes new tracks against
+    currently uncovered edges. Much faster than full analysis.
+    """
+    console.log("[bold cyan]═══ Incremental Coverage Update ═══[/bold cyan]")
+
+    # Load current network with coverage data
+    console.log("[bold]Step 1: Loading data...[/bold]")
+    network = gpd.read_file(str(CONFIG.paths.processed_network))
+
+    # If no coverage data exists, fall back to full analysis
+    if "covered" not in network.columns:
+        console.log("  No existing coverage data. Running full analysis...")
+        return analyze_coverage()
+
+    # Find uncovered required edges
+    uncovered_mask = (network["covered"] == False)
+    if "required" in network.columns:
+        uncovered_mask = uncovered_mask & (network["required"] == True)
+    if "reachable" in network.columns:
+        uncovered_mask = uncovered_mask & (network["reachable"] == True)
+
+    uncovered = network[uncovered_mask]
+    console.log(f"  Currently uncovered edges: {len(uncovered)} ({uncovered['length_m'].sum()/1000:.1f} km)")
+
+    if uncovered.empty:
+        console.log("[green]All required segments already covered![/green]")
+        return network
+
+    # Load new tracks if not provided
+    if new_tracks is None:
+        tracks_path = CONFIG.paths.processed_tracks
+        if not tracks_path.exists():
+            console.log("[yellow]No tracks found.[/yellow]")
+            return network
+        new_tracks = gpd.read_file(str(tracks_path))
+
+    if new_tracks.empty:
+        console.log("[yellow]No tracks to process.[/yellow]")
+        return network
+
+    # Project to local CRS
+    console.log("[bold]Step 2: Processing new tracks...[/bold]")
+    if network.crs != CONFIG.project_crs:
+        network = network.to_crs(CONFIG.project_crs)
+    if new_tracks.crs != CONFIG.project_crs:
+        new_tracks = new_tracks.to_crs(CONFIG.project_crs)
+
+    uncovered_proj = network[uncovered_mask].copy()
+
+    # Buffer new tracks
+    console.log(f"  Buffering {len(new_tracks)} tracks by {BUFFER_DISTANCE_M}m...")
+    buffered = []
+    for _, row in new_tracks.iterrows():
+        try:
+            geom = row.geometry
+            if geom is not None and not geom.is_empty and geom.is_valid:
+                b = geom.buffer(BUFFER_DISTANCE_M)
+                if b is not None and not b.is_empty:
+                    buffered.append(b)
+        except Exception:
+            pass
+
+    if not buffered:
+        console.log("  [yellow]No valid track buffers created.[/yellow]")
+        return network
+
+    console.log(f"  Merging {len(buffered)} track buffers...")
+    track_union = _batch_union(buffered)
+
+    # Test only uncovered edges
+    console.log(f"[bold]Step 3: Testing {len(uncovered_proj)} uncovered edges...[/bold]")
+    newly_covered = 0
+    newly_covered_km = 0
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Checking edges...", total=len(uncovered_proj))
+
+        for idx, row in uncovered_proj.iterrows():
+            edge_geom = row.geometry
+            edge_length = row["length_m"]
+
+            try:
+                if edge_geom is None or edge_geom.is_empty or edge_length <= 0:
+                    progress.update(task, advance=1)
+                    continue
+
+                intersection = edge_geom.intersection(track_union)
+                if intersection.is_empty:
+                    covered_length = 0.0
+                else:
+                    covered_length = intersection.length
+
+                pct = round(min(covered_length / edge_length * 100, 100.0), 1)
+                is_covered = pct >= (COVERAGE_THRESHOLD * 100)
+
+                # Update the main network dataframe
+                network.loc[idx, "coverage_pct"] = pct
+                if is_covered:
+                    network.loc[idx, "covered"] = True
+                    network.loc[idx, "times_covered"] = network.loc[idx].get("times_covered", 0) + 1
+                    newly_covered += 1
+                    newly_covered_km += edge_length / 1000
+
+            except Exception:
+                pass
+
+            progress.update(task, advance=1)
+
+    console.log(f"  [green]✔[/green] Newly covered: {newly_covered} edges ({newly_covered_km:.1f} km)")
+
+    # Save updated network
+    _save_and_summarize(network)
+
+    return network
+
 
 def _build_track_coverage_geometry(tracks: gpd.GeoDataFrame):
     """

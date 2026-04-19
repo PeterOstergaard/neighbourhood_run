@@ -225,3 +225,6 @@ __pycache__/
 # Garmin session cache
 .session_cache
 templates/map_view.html
+
+# Strava token
+data/raw/strava/

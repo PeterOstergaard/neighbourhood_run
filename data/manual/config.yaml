@@ -17,6 +17,17 @@ garmin:
   rate_limit_seconds: 2
   batch_size: 50
 
+strava:
+  activity_types:
+    - Run
+    - TrailRun
+  rate_limit_seconds: 5
+  per_page: 100
+
+routing:
+  min_distance_km: 10
+  max_distance_km: 15
+
 paths:
   raw_boundary: "data/raw/boundaries/postcode_boundary.gpkg"
   processed_home: "data/processed/home_location.gpkg"
@@ -27,3 +38,6 @@ paths:
   garmin_activity_list: "data/raw/garmin/activity_list.json"
   processed_tracks: "data/processed/tracks/tracks.gpkg"
   track_summary: "data/processed/tracks/track_summary.gpkg"
+  planned_routes: "data/processed/routes/planned_routes.gpkg"
+  strava_token: "data/raw/strava/token.json"
+  strava_activity_list: "data/raw/strava/activity_list.json"
