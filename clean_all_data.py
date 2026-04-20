@@ -20,7 +20,6 @@ dirs_to_clean = [
 # Individual files to clean
 files_to_clean = [
     "templates/map_view.html",
-    "templates/map_interactive.html",
 ]
 
 # Files to PRESERVE (just for reference)

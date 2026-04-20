@@ -26,8 +26,14 @@ HIGHWAY_FILTER = (
 # OSM tags that define areas where running is not appropriate.
 # We download these as polygons and remove any network edges inside them.
 EXCLUSION_ZONE_TAGS = {
-    "landuse": ["cemetery", "military", "allotments"],
+    "landuse": ["cemetery", "military"],
     "amenity": ["school"],
+}
+
+# Zones where only dead-end unnamed paths are excluded
+# Through-paths and named roads are kept
+SOFT_EXCLUSION_ZONE_TAGS = {
+    "landuse": ["allotments"],
 }
 
 # --- PHASE 2: POST-DOWNLOAD TAG FILTERS ---
@@ -157,9 +163,15 @@ def _apply_sidewalk_filter(edges: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 def _apply_spatial_exclusions(edges: gpd.GeoDataFrame,
                                exclusion_zones: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
-    Phase 3: Removes network edges that fall inside exclusion zone polygons
-    (cemeteries, military areas, schools).
-    Uses midpoint containment to determine if an edge is inside a zone.
+    Phase 3: Removes network edges inside exclusion zone polygons.
+    
+    Hard exclusions (cemeteries, military, schools):
+        Removes all unnamed/internal paths inside the zone.
+        Keeps named public roads.
+    
+    Soft exclusions (allotments):
+        Only removes dead-end unnamed paths inside the zone.
+        Keeps through-paths and named roads.
     """
     if exclusion_zones.empty:
         console.log("No exclusion zones to apply.")
@@ -177,15 +189,130 @@ def _apply_spatial_exclusions(edges: gpd.GeoDataFrame,
 
     # Calculate the midpoint of each edge
     midpoints = edges.geometry.interpolate(0.5, normalized=True)
+    inside_zone = midpoints.within(combined_zone)
 
-    # Check which midpoints fall inside the combined exclusion zone
-    excluded_mask = midpoints.within(combined_zone)
+    # Classify highway types
+    def normalize_highway(val):
+        if isinstance(val, list):
+            return val[0]
+        return str(val)
+
+    hw_norm = edges["highway"].apply(normalize_highway)
+    internal_types = {"footway", "path", "service", "track", "steps", "pedestrian"}
+    is_internal_type = hw_norm.isin(internal_types)
+    is_unnamed = edges["name"].isna() | (edges["name"] == "")
+
+    # Only exclude: inside zone AND internal/unnamed type
+    excluded_mask = inside_zone & (is_internal_type | is_unnamed)
     n_excluded = excluded_mask.sum()
+    n_protected = (inside_zone & ~excluded_mask).sum()
 
-    console.log(f"  Edges inside exclusion zones: {n_excluded}")
+    console.log(f"  Edges inside hard exclusion zones: {inside_zone.sum()}")
+    console.log(f"  Excluded (internal/unnamed paths): {n_excluded}")
+    console.log(f"  Protected (public named roads): {n_protected}")
 
-    # Keep only edges whose midpoint is NOT inside an exclusion zone
     result = edges[~excluded_mask].copy()
+
+    return result
+
+
+def _download_and_apply_soft_exclusions(edges: gpd.GeoDataFrame,
+                                         boundary_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """
+    Downloads soft exclusion zones (allotments) and removes only
+    dead-end unnamed paths inside them. Through-paths are kept.
+    """
+    console.log("Applying soft exclusion zones (allotments)...")
+
+    polygon_wgs84 = boundary_gdf.geometry.iloc[0]
+    all_zones = []
+
+    for tag_key, tag_values in SOFT_EXCLUSION_ZONE_TAGS.items():
+        for tag_value in tag_values:
+            console.log(f"  Fetching {tag_key}={tag_value}...")
+            try:
+                tags = {tag_key: tag_value}
+                zones = ox.features_from_polygon(polygon_wgs84, tags=tags)
+                zones = zones[zones.geom_type.isin(["Polygon", "MultiPolygon"])]
+                if not zones.empty:
+                    zones = zones[["geometry"]].copy()
+                    all_zones.append(zones)
+                    console.log(f"    Found {len(zones)} polygon(s)")
+            except Exception as e:
+                console.log(f"    [yellow]Warning: {e}[/yellow]")
+
+    if not all_zones:
+        console.log("  No soft exclusion zones found.")
+        return edges
+
+    combined = pd.concat(all_zones, ignore_index=True)
+    zones_gdf = gpd.GeoDataFrame(combined, crs="EPSG:4326")
+    zones_proj = zones_gdf.to_crs(edges.crs)
+
+    # Dissolve into one geometry
+    zones_proj["_dissolve"] = 1
+    zones_dissolved = zones_proj.dissolve(by="_dissolve")
+    soft_zone = zones_dissolved.geometry.iloc[0]
+
+    # Find edges inside soft exclusion zones
+    midpoints = edges.geometry.interpolate(0.5, normalized=True)
+    inside_soft = midpoints.within(soft_zone)
+
+    if not inside_soft.any():
+        console.log("  No edges inside soft exclusion zones.")
+        return edges
+
+    # Build connectivity: count how many edges connect to each endpoint
+    endpoint_count = {}
+    for _, row in edges.iterrows():
+        coords = list(row.geometry.coords)
+        start = (round(coords[0][0], 1), round(coords[0][1], 1))
+        end = (round(coords[-1][0], 1), round(coords[-1][1], 1))
+        endpoint_count[start] = endpoint_count.get(start, 0) + 1
+        endpoint_count[end] = endpoint_count.get(end, 0) + 1
+
+    # A dead-end is where one endpoint has only 1 connection (the edge itself)
+    def normalize_highway(val):
+        if isinstance(val, list):
+            return val[0]
+        return str(val)
+
+    hw_norm = edges["highway"].apply(normalize_highway)
+    internal_types = {"footway", "path", "service", "track"}
+    is_internal = hw_norm.isin(internal_types)
+    is_unnamed = edges["name"].isna() | (edges["name"] == "")
+
+    n_excluded = 0
+    exclude_indices = []
+
+    for idx in edges[inside_soft].index:
+        row = edges.loc[idx]
+
+        # Skip named roads — always keep
+        if not is_unnamed.loc[idx]:
+            continue
+
+        # Skip non-internal road types — always keep
+        if not is_internal.loc[idx]:
+            continue
+
+        # Check if this is a dead-end (one endpoint connects to only this edge)
+        coords = list(row.geometry.coords)
+        start = (round(coords[0][0], 1), round(coords[0][1], 1))
+        end = (round(coords[-1][0], 1), round(coords[-1][1], 1))
+
+        is_dead_end = endpoint_count.get(start, 0) <= 1 or endpoint_count.get(end, 0) <= 1
+
+        if is_dead_end:
+            exclude_indices.append(idx)
+            n_excluded += 1
+
+    n_through = inside_soft.sum() - n_excluded
+    console.log(f"  Edges inside allotments: {inside_soft.sum()}")
+    console.log(f"  Dead-end private paths (excluded): {n_excluded}")
+    console.log(f"  Through-paths (kept): {n_through}")
+
+    result = edges.drop(index=exclude_indices).copy()
 
     return result
 
@@ -434,7 +561,7 @@ def build_runnable_network(boundary_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     optional_service = is_service_2b & is_unnamed_2b & is_short_service_2b
     filtered.loc[optional_service, "required"] = False
 
-# Rule 2: Very short segments (< 10m) are optional UNLESS both their
+    # Rule 2: Very short segments (< 10m) are optional UNLESS both their
     # endpoints connect to required segments (making them legitimate connectors)
     very_short_mask = filtered["length_m"] < 10.0
     
@@ -466,12 +593,58 @@ def build_runnable_network(boundary_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         console.log(f"  Short segments (<10m): {n_kept} are connectors (required), {n_optional} optional")
     else:
         console.log(f"  No short segments found")
+
+    # Rule 3: Segments that bridge two required segments should be required
+    # even if they would otherwise be optional (prevents gaps in routes)
+    console.log("  Checking for gap-bridging segments...")
+    required_endpoints = set()
+    for _, row in filtered[filtered["required"]].iterrows():
+        coords = list(row.geometry.coords)
+        required_endpoints.add((round(coords[0][0], 1), round(coords[0][1], 1)))
+        required_endpoints.add((round(coords[-1][0], 1), round(coords[-1][1], 1)))
+
+    n_gaps_fixed = 0
+    for idx in filtered[~filtered["required"]].index:
+        coords = list(filtered.loc[idx, "geometry"].coords)
+        start = (round(coords[0][0], 1), round(coords[0][1], 1))
+        end = (round(coords[-1][0], 1), round(coords[-1][1], 1))
+
+        start_connected = start in required_endpoints
+        end_connected = end in required_endpoints
+
+        if start_connected and end_connected:
+            filtered.loc[idx, "required"] = True
+            # Add this segment's endpoints to required_endpoints
+            # so it can cascade to other gap segments
+            required_endpoints.add(start)
+            required_endpoints.add(end)
+            n_gaps_fixed += 1
+
+    if n_gaps_fixed > 0:
+        # Run a second pass to catch cascading gaps
+        for idx in filtered[~filtered["required"]].index:
+            coords = list(filtered.loc[idx, "geometry"].coords)
+            start = (round(coords[0][0], 1), round(coords[0][1], 1))
+            end = (round(coords[-1][0], 1), round(coords[-1][1], 1))
+
+            if start in required_endpoints and end in required_endpoints:
+                filtered.loc[idx, "required"] = True
+                required_endpoints.add(start)
+                required_endpoints.add(end)
+                n_gaps_fixed += 1
+
+    console.log(f"  Gap-bridging segments promoted to required: {n_gaps_fixed}")
     
-    # --- PHASE 3: SPATIAL EXCLUSIONS ---
+# --- PHASE 3: SPATIAL EXCLUSIONS ---
     console.log("[bold]Step 5: Applying spatial exclusions (Phase 3)...[/bold]")
     exclusion_zones = _download_exclusion_zones(boundary_gdf)
     filtered = _apply_spatial_exclusions(filtered, exclusion_zones)
-    console.log(f"  After spatial exclusions: {len(filtered)} edges, {filtered['length_m'].sum() / 1000:.1f} km")
+    console.log(f"  After hard exclusions: {len(filtered)} edges, {filtered['length_m'].sum() / 1000:.1f} km")
+
+    # --- PHASE 3b: SOFT EXCLUSIONS (allotments) ---
+    console.log("[bold]Step 5b: Applying soft exclusions (allotments)...[/bold]")
+    filtered = _download_and_apply_soft_exclusions(filtered, boundary_gdf)
+    console.log(f"  After soft exclusions: {len(filtered)} edges, {filtered['length_m'].sum() / 1000:.1f} km")
 
     # --- PHASE 4: MANUAL EXCLUSIONS ---
     console.log("[bold]Step 6: Applying manual exclusions (Phase 4)...[/bold]")
