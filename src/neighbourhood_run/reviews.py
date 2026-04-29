@@ -204,33 +204,43 @@ def suggest_route_matches(new_activity_ids: list[str], max_matches: int = 5) -> 
 
 def get_route_review_payload(route_id: int, activity_ids: list[str]) -> dict:
     """
-    Returns payload for route review UI:
-    - route geometry
-    - selected route segment edge_ids
-    - recent track geometries
-    - route-segment subset of network only
+    Returns payload for route review UI.
+    Includes ALL network segments near the planned route geometry,
+    not just the segments planned for new coverage. This allows
+    reviewing connector segments (like major roads) that the route
+    traverses but doesn't specifically target.
     """
-    routes = gpd.read_file(str(CONFIG.paths.planned_routes)).to_crs("EPSG:4326")
-    network = gpd.read_file(str(CONFIG.paths.processed_network)).to_crs("EPSG:4326")
-    tracks = gpd.read_file(str(CONFIG.paths.processed_tracks)).to_crs("EPSG:4326")
+    routes = gpd.read_file(str(CONFIG.paths.planned_routes)).to_crs(CONFIG.project_crs)
+    network = gpd.read_file(str(CONFIG.paths.processed_network)).to_crs(CONFIG.project_crs)
+    tracks = gpd.read_file(str(CONFIG.paths.processed_tracks)).to_crs(CONFIG.project_crs)
 
     route = routes[routes["route_id"] == route_id]
     if route.empty:
         raise ValueError(f"Route {route_id} not found")
 
     route_row = route.iloc[0]
-    covered_edge_ids = route_row.get("covered_edge_ids", "")
-    route_edge_ids = []
-    if covered_edge_ids:
-        route_edge_ids = [int(x) for x in str(covered_edge_ids).split(",") if str(x).strip()]
 
-    route_segments = network[network["edge_id"].isin(route_edge_ids)].copy()
+    # Find ALL network segments near the route geometry
+    route_geom = route_row.geometry
+    route_buffer = route_geom.buffer(20)  # 20m buffer around the route line
+
+    # A segment is "on the route" if its midpoint falls within the buffer
+    midpoints = network.geometry.interpolate(0.5, normalized=True)
+    near_route = midpoints.within(route_buffer)
+    route_segments = network[near_route].copy()
+
+    # Get recent tracks for visual comparison
     recent_tracks = tracks[tracks["activity_id"].astype(str).isin([str(x) for x in activity_ids])].copy()
 
+    # Convert to WGS84 for frontend
+    route_wgs = route.to_crs("EPSG:4326")
+    route_segments_wgs = route_segments.to_crs("EPSG:4326")
+    recent_tracks_wgs = recent_tracks.to_crs("EPSG:4326") if not recent_tracks.empty else gpd.GeoDataFrame()
+
     return {
-        "route": json.loads(route.to_json()),
-        "route_segments": json.loads(route_segments.to_json()),
-        "recent_tracks": json.loads(recent_tracks.to_json()),
+        "route": json.loads(route_wgs.to_json()),
+        "route_segments": json.loads(route_segments_wgs.to_json()),
+        "recent_tracks": json.loads(recent_tracks_wgs.to_json()),
         "activity_ids": activity_ids,
         "route_id": route_id,
         "route_name": route_row["route_name"],

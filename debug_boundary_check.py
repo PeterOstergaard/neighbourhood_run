@@ -26,8 +26,7 @@ network_proj = network.to_crs(CONFIG.project_crs)
 boundary_geom = boundary_proj.geometry.iloc[0]
 
 # Test specific roads
-test_roads = ['Sylbækvej', 'Elkjærvej', 'Vesterløkken', 'Carit Etlars',
-              'Egsagervej', 'Klamsagervej', 'Ved Lunden', 'Lærkevej'
+test_roads = ['Sylbækvej', 'Elkjærvej', 'Vesterløkken', 'Carit Etlars','Egsagervej', 'Klamsagervej', 'Ved Lunden', 'Lærkevej'
               ]
 
 for road in test_roads:

@@ -485,10 +485,28 @@ def generate_all_routes() -> gpd.GeoDataFrame:
     max_dist = CONFIG.routing.max_distance_km * 1000
     min_dist = CONFIG.routing.min_distance_km * 1000
 
-    # Load network
+    # Load network and apply any segment overrides
     console.log("[bold]Step 1: Loading network...[/bold]")
     network = gpd.read_file(str(CONFIG.paths.processed_network))
     network = network.to_crs(CONFIG.project_crs)
+
+    # Apply segment overrides (e.g., segments marked not_runnable during review)
+    from .reviews import load_segment_overrides
+    overrides = load_segment_overrides()
+    if overrides:
+        override_map = {o["edge_id"]: o["status"] for o in overrides}
+        n_blocked = 0
+        for idx, row in network.iterrows():
+            eid = row["edge_id"]
+            if eid in override_map:
+                status = override_map[eid]
+                if status == "not_runnable":
+                    network.at[idx, "required"] = False
+                    n_blocked += 1
+                elif status in ("sidewalk_present", "runnable_no_sidewalk"):
+                    network.at[idx, "required"] = True
+        if n_blocked > 0:
+            console.log(f"  Applied {n_blocked} not-runnable overrides")
 
     # Load home
     home_gdf = gpd.read_file(str(CONFIG.paths.processed_home))
