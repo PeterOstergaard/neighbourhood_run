@@ -8,6 +8,7 @@ from pyproj import Transformer
 from rich.console import Console
 import warnings
 from .config import CONFIG
+from .reviews import apply_segment_overrides
 
 warnings.filterwarnings("ignore", category=UserWarning, module='osmnx')
 
@@ -151,8 +152,11 @@ def _apply_sidewalk_filter(edges: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     if "required" not in edges.columns:
         edges["required"] = True
 
-    # Mark major roads without sidewalk as optional connectors
+#    Mark major roads without sidewalk as optional connectors
     edges.loc[no_sidewalk, "required"] = False
+    # Flag these so gap-bridging doesn't promote them back
+    edges["_sidewalk_excluded"] = False
+    edges.loc[no_sidewalk, "_sidewalk_excluded"] = True
 
     # Clean up temporary columns
     result = edges.drop(columns=["_highway_norm", "_sidewalk_norm"], errors="ignore")
@@ -550,12 +554,20 @@ def build_runnable_network(boundary_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     is_unnamed_2b = filtered["name"].isna() | (filtered["name"] == "")
     is_short_service_2b = filtered["length_m"] <= 75
 
-    # Start with boundary zone info if available
+    # Combine boundary zone with sidewalk filter results.
+    # A segment is required only if:
+    #   - It's inside the boundary (or promoted as a named road), AND
+    #   - It wasn't marked optional by the sidewalk filter
     if "_inside_boundary" in filtered.columns:
-        filtered["required"] = filtered["_inside_boundary"]
+        # If sidewalk filter already set required=False, respect that
+        if "required" in filtered.columns:
+            filtered["required"] = filtered["required"] & filtered["_inside_boundary"]
+        else:
+            filtered["required"] = filtered["_inside_boundary"]
         filtered = filtered.drop(columns=["_inside_boundary"])
     else:
-        filtered["required"] = True
+        if "required" not in filtered.columns:
+            filtered["required"] = True
 
     # Rule 1: Short unnamed service roads are optional
     optional_service = is_service_2b & is_unnamed_2b & is_short_service_2b
@@ -595,34 +607,24 @@ def build_runnable_network(boundary_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         console.log(f"  No short segments found")
 
     # Rule 3: Segments that bridge two required segments should be required
-    # even if they would otherwise be optional (prevents gaps in routes)
+    # even if they would otherwise be optional (prevents gaps in routes).
+    # EXCEPT: segments marked by sidewalk filter stay optional.
     console.log("  Checking for gap-bridging segments...")
-    required_endpoints = set()
-    for _, row in filtered[filtered["required"]].iterrows():
-        coords = list(row.geometry.coords)
-        required_endpoints.add((round(coords[0][0], 1), round(coords[0][1], 1)))
-        required_endpoints.add((round(coords[-1][0], 1), round(coords[-1][1], 1)))
-
+    
     n_gaps_fixed = 0
-    for idx in filtered[~filtered["required"]].index:
-        coords = list(filtered.loc[idx, "geometry"].coords)
-        start = (round(coords[0][0], 1), round(coords[0][1], 1))
-        end = (round(coords[-1][0], 1), round(coords[-1][1], 1))
+    for pass_num in range(5):
+        required_endpoints = set()
+        for _, row in filtered[filtered["required"]].iterrows():
+            coords = list(row.geometry.coords)
+            required_endpoints.add((round(coords[0][0], 1), round(coords[0][1], 1)))
+            required_endpoints.add((round(coords[-1][0], 1), round(coords[-1][1], 1)))
 
-        start_connected = start in required_endpoints
-        end_connected = end in required_endpoints
-
-        if start_connected and end_connected:
-            filtered.loc[idx, "required"] = True
-            # Add this segment's endpoints to required_endpoints
-            # so it can cascade to other gap segments
-            required_endpoints.add(start)
-            required_endpoints.add(end)
-            n_gaps_fixed += 1
-
-    if n_gaps_fixed > 0:
-        # Run a second pass to catch cascading gaps
+        rescued_this_pass = 0
         for idx in filtered[~filtered["required"]].index:
+            # Never promote segments explicitly excluded by sidewalk filter
+            if filtered.loc[idx].get("_sidewalk_excluded", False):
+                continue
+
             coords = list(filtered.loc[idx, "geometry"].coords)
             start = (round(coords[0][0], 1), round(coords[0][1], 1))
             end = (round(coords[-1][0], 1), round(coords[-1][1], 1))
@@ -631,9 +633,76 @@ def build_runnable_network(boundary_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
                 filtered.loc[idx, "required"] = True
                 required_endpoints.add(start)
                 required_endpoints.add(end)
-                n_gaps_fixed += 1
+                rescued_this_pass += 1
+
+        n_gaps_fixed += rescued_this_pass
+        if rescued_this_pass == 0:
+            break
 
     console.log(f"  Gap-bridging segments promoted to required: {n_gaps_fixed}")
+
+    # Rule 4 (FINAL): Named roads of runnable types are ALWAYS required
+    # if they are inside the boundary. This overrides Rules 1-3 but NOT
+    # the sidewalk filter (primary/secondary without sidewalks stay optional).
+    console.log("  Applying final named-road override...")
+    
+    # Recalculate which segments are inside the boundary
+    midpoints_final = filtered.geometry.interpolate(0.5, normalized=True)
+    boundary_proj_final = gpd.read_file(str(CONFIG.paths.raw_boundary)).to_crs(CONFIG.project_crs)
+    boundary_geom_final = boundary_proj_final.geometry.iloc[0]
+    inside_final = midpoints_final.within(boundary_geom_final)
+    
+    is_named_final = (
+        filtered["name"].notna() & 
+        (filtered["name"] != "") & 
+        (filtered["name"].astype(str) != "nan")
+    )
+    
+    def normalize_hw_final(val):
+        if isinstance(val, list):
+            return val[0]
+        return str(val)
+    
+    hw_final = filtered["highway"].apply(normalize_hw_final)
+    
+    promotable_types = {
+        "residential", "living_street", "tertiary", "tertiary_link",
+        "unclassified", "pedestrian", "footway", "path", "cycleway",
+        "track", "bridleway", "steps"
+    }
+    is_promotable = hw_final.isin(promotable_types)
+    
+    # Don't override sidewalk filter
+    if "_sidewalk_excluded" in filtered.columns:
+        is_sidewalk_excluded = filtered["_sidewalk_excluded"].fillna(False)
+    else:
+        is_sidewalk_excluded = pd.Series(False, index=filtered.index)
+        
+    final_promote = is_named_final & is_promotable & inside_final & ~is_sidewalk_excluded & ~filtered["required"]
+    n_final_promoted = final_promote.sum()
+    
+    # Debug: show what's being checked
+    still_optional_named = is_named_final & is_promotable & inside_final & ~filtered["required"]
+    console.log(f"  DEBUG: Named+promotable+inside+still_optional: {still_optional_named.sum()}")
+    console.log(f"  DEBUG: Of those, sidewalk_excluded: {(still_optional_named & is_sidewalk_excluded).sum()}")
+    console.log(f"  DEBUG: Final promote count: {n_final_promoted}")
+    
+    if n_final_promoted > 0:
+        # Show which roads are being promoted
+        promoted_names = filtered.loc[final_promote, "name"].value_counts()
+        for name, count in promoted_names.head(10).items():
+            console.log(f"    Promoting: {name} ({count} segments)")
+    
+    filtered.loc[final_promote, "required"] = True
+    
+    if n_final_promoted > 0:
+        console.log(f"  Named roads final promotion: {n_final_promoted}")
+
+    n_required = filtered["required"].sum()
+    n_optional = len(filtered) - n_required
+    required_km = filtered.loc[filtered["required"], "length_m"].sum() / 1000
+    optional_km = filtered.loc[~filtered["required"], "length_m"].sum() / 1000
+    console.log(f"  Final: Required {n_required} ({required_km:.1f} km), Optional {n_optional} ({optional_km:.1f} km)")
     
 # --- PHASE 3: SPATIAL EXCLUSIONS ---
     console.log("[bold]Step 5: Applying spatial exclusions (Phase 3)...[/bold]")
@@ -653,6 +722,30 @@ def build_runnable_network(boundary_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     filtered = _apply_manual_exclusions(filtered)
     console.log(f"  After manual exclusions: {len(filtered)} edges, {filtered['length_m'].sum() / 1000:.1f} km")
 
+    # --- PHASE 5: LOCAL SEGMENT OVERRIDES ---
+    console.log("[bold]Step 6b: Applying local segment overrides...[/bold]")
+    from .reviews import load_segment_overrides
+    overrides = load_segment_overrides()
+    if overrides:
+        # Validate that override edge IDs exist in current network
+        current_ids = set(filtered["edge_id"].tolist())
+        valid_overrides = [o for o in overrides if o["edge_id"] in current_ids]
+        stale_overrides = [o for o in overrides if o["edge_id"] not in current_ids]
+        
+        if stale_overrides:
+            console.log(f"  [yellow]Warning: {len(stale_overrides)} overrides reference old edge IDs (cleared)[/yellow]")
+            # Save only valid overrides back
+            from .reviews import save_segment_overrides
+            save_segment_overrides(valid_overrides)
+        
+        if valid_overrides:
+            filtered = apply_segment_overrides(filtered)
+        else:
+            console.log("  No valid overrides to apply.")
+    else:
+        console.log("  No segment overrides found.")
+    console.log(f"  After overrides: {len(filtered)} edges, {filtered['length_m'].sum() / 1000:.1f} km")
+
     # --- REVIEW FLAGS ---
     console.log("[bold]Step 7: Adding review flags...[/bold]")
     filtered = _add_review_flags(filtered)
@@ -662,6 +755,45 @@ def build_runnable_network(boundary_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     # Reassign edge IDs after all filtering
     filtered = filtered.reset_index(drop=True)
     filtered['edge_id'] = range(len(filtered))
+
+    # FINAL SAFETY NET: Named runnable roads INSIDE the boundary must be required.
+    # Uses a small buffer (25m) to catch roads running along the boundary edge.
+    # Does NOT promote roads genuinely in the buffer zone (other postal codes).
+    boundary_check = gpd.read_file(str(CONFIG.paths.raw_boundary)).to_crs(CONFIG.project_crs)
+    boundary_check_geom = boundary_check.geometry.iloc[0]
+    boundary_buffered_25m = boundary_check_geom.buffer(25)
+    
+    midpoints_check = filtered.geometry.interpolate(0.5, normalized=True)
+    inside_check = midpoints_check.within(boundary_buffered_25m)
+    
+    is_named_final = (
+        filtered["name"].notna() & 
+        (filtered["name"] != "") & 
+        (filtered["name"].astype(str) != "nan")
+    )
+    
+    def norm_hw_final(val):
+        return val[0] if isinstance(val, list) else str(val)
+    
+    hw_final = filtered["highway"].apply(norm_hw_final)
+    
+    safe_types = {
+        "residential", "living_street", "tertiary", "tertiary_link",
+        "unclassified", "pedestrian", "footway", "path", "cycleway",
+        "track", "bridleway", "steps"
+    }
+    is_safe_type = hw_final.isin(safe_types)
+    
+    if "_sidewalk_excluded" in filtered.columns:
+        is_sw_excluded = filtered["_sidewalk_excluded"].fillna(False)
+    else:
+        is_sw_excluded = pd.Series(False, index=filtered.index)
+    
+    safety_promote = is_named_final & is_safe_type & inside_check & ~is_sw_excluded & ~filtered["required"]
+    n_safety = safety_promote.sum()
+    if n_safety > 0:
+        filtered.loc[safety_promote, "required"] = True
+        console.log(f"  [yellow]Safety net: promoted {n_safety} named roads to required[/yellow]")
 
     # Determine reachability from home
     import networkx as nx
@@ -729,6 +861,9 @@ def build_runnable_network(boundary_gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
 
     console.log(f"  Reachable from home: {n_reachable} edges, {reach_km:.1f} km")
     console.log(f"  Unreachable islands: {n_unreachable} edges, {unreach_km:.1f} km")
+
+    # Clean up temporary columns
+    filtered = filtered.drop(columns=["_sidewalk_excluded"], errors="ignore")
 
     cols_to_keep = [
         'edge_id', 'osmid', 'highway', 'name', 'service',

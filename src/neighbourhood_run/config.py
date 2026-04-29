@@ -50,6 +50,8 @@ class PathsConfig(BaseModel):
     planned_routes: str
     strava_token: str
     strava_activity_list: str
+    route_reviews: str
+    segment_overrides: str
 
 
 class AppConfig(BaseModel):

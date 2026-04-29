@@ -41,3 +41,5 @@ paths:
   planned_routes: "data/processed/routes/planned_routes.gpkg"
   strava_token: "data/raw/strava/token.json"
   strava_activity_list: "data/raw/strava/activity_list.json"
+  route_reviews: "data/processed/reviews/route_reviews.json"
+  segment_overrides: "data/manual/segment_overrides.json"

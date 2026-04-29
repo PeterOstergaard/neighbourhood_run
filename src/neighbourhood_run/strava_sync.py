@@ -497,4 +497,11 @@ def run_full_sync():
 
     console.log("[bold cyan]═══ Strava Sync Complete ═══[/bold cyan]")
 
-    return tracks
+    new_activity_ids = []
+    if new_with_streams:
+        new_activity_ids = [f"strava_{a['id']}" for a in new_with_streams]
+
+    return {
+        "tracks": tracks,
+        "new_activity_ids": new_activity_ids,
+    }
